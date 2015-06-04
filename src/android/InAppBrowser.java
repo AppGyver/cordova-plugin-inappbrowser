@@ -18,9 +18,12 @@
 */
 package org.apache.cordova.inappbrowser;
 
+import com.appgyver.webview.AGXWalkWebView;
+
 import android.annotation.SuppressLint;
 
 import org.xwalk.core.XWalkNavigationHistory;
+import org.xwalk.core.XWalkResourceClient;
 import org.xwalk.core.XWalkUIClient;
 import org.xwalk.core.XWalkView;
 
@@ -63,6 +66,7 @@ import org.apache.cordova.PluginManager;
 import org.apache.cordova.PluginResult;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.xwalk.core.internal.XWalkCookieManager;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -421,22 +425,11 @@ public class InAppBrowser extends CordovaPlugin {
         this.cordova.getActivity().runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                childView.setUIClient(new XWalkUIClient(childView) {
-                    @Override
-                    public void onPageLoadStopped(XWalkView view, String url, LoadStatus status) {
-                        super.onPageLoadStopped(view, url, status);
-                        if (status.equals(LoadStatus.FINISHED)) {
-                            if (dialog != null) {
-                                dialog.dismiss();
-                            }
-                        }
-                    }
-                });
-
-                // NB: From SDK 19: "If you call methods on WebView from any thread
-                // other than your app's UI thread, it can cause unexpected results."
-                // http://developer.android.com/guide/webapps/migrating.html#Threads
-                childView.load("about:blank", null);
+                childView.setUIClient(new XWalkUIClient(childView));
+                childView.load("about:blank", "");
+                if (dialog != null) {
+                    dialog.dismiss();
+                }
             }
         });
 
@@ -761,9 +754,9 @@ public class InAppBrowser extends CordovaPlugin {
                 inAppWebView = createWebView();
 
                 if (clearAllCache) {
-                    CookieManager.getInstance().removeAllCookie();
+                    doClearAllCache();
                 } else if (clearSessionCache) {
-                    CookieManager.getInstance().removeSessionCookie();
+                    doClearSessionCache();
                 }
 
                 openUrl(url);
@@ -808,6 +801,24 @@ public class InAppBrowser extends CordovaPlugin {
         return "";
     }
 
+    private void doClearSessionCache() {
+        if(this.webView.isXWalkWebView()){
+            new XWalkCookieManager().removeSessionCookie();
+        }
+        else{
+            CookieManager.getInstance().removeSessionCookie();
+        }
+    }
+
+    private void doClearAllCache() {
+        if(this.webView.isXWalkWebView()){
+            new XWalkCookieManager().removeAllCookie();
+        }
+        else{
+            CookieManager.getInstance().removeAllCookie();
+        }
+    }
+
     private View createWebView() {
         View newWebView = null;
         if(this.webView.isXWalkWebView()){
@@ -816,12 +827,37 @@ public class InAppBrowser extends CordovaPlugin {
         else{
             newWebView = createPlatformWebView();
         }
-        newWebView.setLayoutParams(new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+        newWebView.setLayoutParams(
+                new LinearLayout.LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
         return newWebView;
     }
 
     private View createXwalkWebView() {
         XWalkView xWalkView = new XWalkView(cordova.getActivity(), cordova.getActivity());
+
+        xWalkView.setUIClient(new XWalkUIClient(xWalkView) {
+            @Override
+            public void onPageLoadStarted(XWalkView view, String url) {
+                super.onPageLoadStarted(view, url);
+                onPageStartedImpl(url);
+            }
+
+            @Override
+            public void onPageLoadStopped(XWalkView view, String url, LoadStatus status) {
+                super.onPageLoadStopped(view, url, status);
+                if (status.equals(LoadStatus.FINISHED)) {
+                    onPageFinishedImpl(url);
+                } else if (status.equals(LoadStatus.FAILED)) {
+                    onReceivedErrorImpl(url, -100, "Page failed to load (XWalk WebView)");
+                } else if (status.equals(LoadStatus.CANCELLED)) {
+                    onReceivedErrorImpl(url, -200, "Page load canceled (XWalk WebView)");
+                }
+            }
+        });
+
+        AGXWalkWebView agxWalkWebView = (AGXWalkWebView)this.webView;
+        xWalkView.setResourceClient(agxWalkWebView.getXWalkResourceClient());
+
         return xWalkView;
     }
 
@@ -882,6 +918,81 @@ public class InAppBrowser extends CordovaPlugin {
         }
     }
 
+    void onPageStartedImpl(String url){
+        String newloc = "";
+        if (url.startsWith("http:") || url.startsWith("https:") || url.startsWith("file:")) {
+            newloc = url;
+        }
+        // If dialing phone (tel:5551212)
+        else if (url.startsWith(WebView.SCHEME_TEL)) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_DIAL);
+                intent.setData(Uri.parse(url));
+                cordova.getActivity().startActivity(intent);
+            } catch (android.content.ActivityNotFoundException e) {
+                LOG.e(LOG_TAG, "Error dialing " + url + ": " + e.toString());
+            }
+        }
+
+        else if (url.startsWith("geo:") || url.startsWith(WebView.SCHEME_MAILTO) || url.startsWith("market:")) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_VIEW);
+                intent.setData(Uri.parse(url));
+                cordova.getActivity().startActivity(intent);
+            } catch (android.content.ActivityNotFoundException e) {
+                LOG.e(LOG_TAG, "Error with " + url + ": " + e.toString());
+            }
+        }
+        // If sms:5551212?body=This is the message
+        else if (url.startsWith("sms:")) {
+            try {
+                Intent intent = new Intent(Intent.ACTION_VIEW);
+
+                // Get address
+                String address = null;
+                int parmIndex = url.indexOf('?');
+                if (parmIndex == -1) {
+                    address = url.substring(4);
+                }
+                else {
+                    address = url.substring(4, parmIndex);
+
+                    // If body, then set sms body
+                    Uri uri = Uri.parse(url);
+                    String query = uri.getQuery();
+                    if (query != null) {
+                        if (query.startsWith("body=")) {
+                            intent.putExtra("sms_body", query.substring(5));
+                        }
+                    }
+                }
+                intent.setData(Uri.parse("sms:" + address));
+                intent.putExtra("address", address);
+                intent.setType("vnd.android-dir/mms-sms");
+                cordova.getActivity().startActivity(intent);
+            } catch (android.content.ActivityNotFoundException e) {
+                LOG.e(LOG_TAG, "Error sending sms " + url + ":" + e.toString());
+            }
+        }
+        else {
+            newloc = "http://" + url;
+        }
+
+        if (!newloc.equals(edittext.getText().toString())) {
+            edittext.setText(newloc);
+        }
+
+        try {
+            JSONObject obj = new JSONObject();
+            obj.put("type", LOAD_START_EVENT);
+            obj.put("url", newloc);
+
+            sendUpdate(obj, true);
+        } catch (JSONException ex) {
+            Log.d(LOG_TAG, "Should never happen");
+        }
+    }
+
     /**
      * The webview client receives notifications about appView
      */
@@ -909,108 +1020,46 @@ public class InAppBrowser extends CordovaPlugin {
         @Override
         public void onPageStarted(WebView view, String url,  Bitmap favicon) {
             super.onPageStarted(view, url, favicon);
-            String newloc = "";
-            if (url.startsWith("http:") || url.startsWith("https:") || url.startsWith("file:")) {
-                newloc = url;
-            }
-            // If dialing phone (tel:5551212)
-            else if (url.startsWith(WebView.SCHEME_TEL)) {
-                try {
-                    Intent intent = new Intent(Intent.ACTION_DIAL);
-                    intent.setData(Uri.parse(url));
-                    cordova.getActivity().startActivity(intent);
-                } catch (android.content.ActivityNotFoundException e) {
-                    LOG.e(LOG_TAG, "Error dialing " + url + ": " + e.toString());
-                }
-            }
 
-            else if (url.startsWith("geo:") || url.startsWith(WebView.SCHEME_MAILTO) || url.startsWith("market:")) {
-                try {
-                    Intent intent = new Intent(Intent.ACTION_VIEW);
-                    intent.setData(Uri.parse(url));
-                    cordova.getActivity().startActivity(intent);
-                } catch (android.content.ActivityNotFoundException e) {
-                    LOG.e(LOG_TAG, "Error with " + url + ": " + e.toString());
-                }
-            }
-            // If sms:5551212?body=This is the message
-            else if (url.startsWith("sms:")) {
-                try {
-                    Intent intent = new Intent(Intent.ACTION_VIEW);
-
-                    // Get address
-                    String address = null;
-                    int parmIndex = url.indexOf('?');
-                    if (parmIndex == -1) {
-                        address = url.substring(4);
-                    }
-                    else {
-                        address = url.substring(4, parmIndex);
-
-                        // If body, then set sms body
-                        Uri uri = Uri.parse(url);
-                        String query = uri.getQuery();
-                        if (query != null) {
-                            if (query.startsWith("body=")) {
-                                intent.putExtra("sms_body", query.substring(5));
-                            }
-                        }
-                    }
-                    intent.setData(Uri.parse("sms:" + address));
-                    intent.putExtra("address", address);
-                    intent.setType("vnd.android-dir/mms-sms");
-                    cordova.getActivity().startActivity(intent);
-                } catch (android.content.ActivityNotFoundException e) {
-                    LOG.e(LOG_TAG, "Error sending sms " + url + ":" + e.toString());
-                }
-            }
-            else {
-                newloc = "http://" + url;
-            }
-
-            if (!newloc.equals(edittext.getText().toString())) {
-                edittext.setText(newloc);
-            }
-
-            try {
-                JSONObject obj = new JSONObject();
-                obj.put("type", LOAD_START_EVENT);
-                obj.put("url", newloc);
-
-                sendUpdate(obj, true);
-            } catch (JSONException ex) {
-                Log.d(LOG_TAG, "Should never happen");
-            }
+            onPageStartedImpl(url);
         }
 
         public void onPageFinished(WebView view, String url) {
             super.onPageFinished(view, url);
 
-            try {
-                JSONObject obj = new JSONObject();
-                obj.put("type", LOAD_STOP_EVENT);
-                obj.put("url", url);
-
-                sendUpdate(obj, true);
-            } catch (JSONException ex) {
-                Log.d(LOG_TAG, "Should never happen");
-            }
+            onPageFinishedImpl(url);
         }
 
         public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
             super.onReceivedError(view, errorCode, description, failingUrl);
 
-            try {
-                JSONObject obj = new JSONObject();
-                obj.put("type", LOAD_ERROR_EVENT);
-                obj.put("url", failingUrl);
-                obj.put("code", errorCode);
-                obj.put("message", description);
+            onReceivedErrorImpl(failingUrl, errorCode, description);
+        }
+    }
 
-                sendUpdate(obj, true, PluginResult.Status.ERROR);
-            } catch (JSONException ex) {
-                Log.d(LOG_TAG, "Should never happen");
-            }
+    private void onReceivedErrorImpl(String failingUrl, int errorCode, String description) {
+        try {
+            JSONObject obj = new JSONObject();
+            obj.put("type", LOAD_ERROR_EVENT);
+            obj.put("url", failingUrl);
+            obj.put("code", errorCode);
+            obj.put("message", description);
+
+            sendUpdate(obj, true, PluginResult.Status.ERROR);
+        } catch (JSONException ex) {
+            Log.d(LOG_TAG, "Should never happen");
+        }
+    }
+
+    private void onPageFinishedImpl(String url) {
+        try {
+            JSONObject obj = new JSONObject();
+            obj.put("type", LOAD_STOP_EVENT);
+            obj.put("url", url);
+
+            sendUpdate(obj, true);
+        } catch (JSONException ex) {
+            Log.d(LOG_TAG, "Should never happen");
         }
     }
 }
