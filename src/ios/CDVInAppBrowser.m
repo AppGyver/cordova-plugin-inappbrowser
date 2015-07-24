@@ -37,14 +37,55 @@
 @interface CDVInAppBrowser () {
     NSInteger _previousStatusBarStyle;
 }
+
+@property (nonatomic, strong) id notificationRef;
+
 @end
 
 @implementation CDVInAppBrowser
 
-- (void)pluginInitialize
+@synthesize notificationRef;
+
+- (CDVInAppBrowser*)initWithWebView:(UIWebView*)theWebView
 {
-    _previousStatusBarStyle = -1;
-    _callbackIdPattern = nil;
+    self = [super initWithWebView:theWebView];
+    if (self != nil) {
+        _previousStatusBarStyle = -1;
+        _callbackIdPattern = nil;
+    }
+
+    return self;
+}
+
+-(void)stopNotifications{
+    if(self.notificationRef){
+        [[NSNotificationCenter defaultCenter] removeObserver:self.notificationRef];
+    }
+    self.notificationRef = nil;
+}
+
+-(void)startNotifications{
+    [self stopNotifications];
+
+    __weak typeof (self) weakSelf = self;
+
+    self.notificationRef =  [[NSNotificationCenter defaultCenter] addObserverForName:@"AGRedirectResponse" object:nil queue:nil usingBlock:^(NSNotification *note) {
+        __strong typeof (self) strongSelf = weakSelf;
+
+        [strongSelf sendLoadStart:note.userInfo[@"toUrl"]];
+
+    }];
+}
+
+// Send a loadstart event for each top-level navigation (includes redirects).
+
+-(void)sendLoadStart:(NSString*)url{
+    CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
+                                                  messageAsDictionary:@{@"type":@"loadstart", @"url":url}];
+
+    [pluginResult setKeepCallback:[NSNumber numberWithBool:YES]];
+
+    [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
 }
 
 - (void)onReset
@@ -389,11 +430,9 @@
         }
     } else if ((self.callbackId != nil) && isTopLevelNavigation) {
         // Send a loadstart event for each top-level navigation (includes redirects).
-        CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK
-                                                      messageAsDictionary:@{@"type":@"loadstart", @"url":[url absoluteString]}];
-        [pluginResult setKeepCallback:[NSNumber numberWithBool:YES]];
+        [self sendLoadStart:[url absoluteString]];
 
-        [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
+        [self startNotifications];
     }
 
     return YES;
@@ -415,6 +454,8 @@
 
         [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
     }
+
+    [self stopNotifications];
 }
 
 - (void)webView:(UIWebView*)theWebView didFailLoadWithError:(NSError*)error
@@ -427,6 +468,8 @@
 
         [self.commandDelegate sendPluginResult:pluginResult callbackId:self.callbackId];
     }
+
+    [self stopNotifications];
 }
 
 - (void)browserExit
